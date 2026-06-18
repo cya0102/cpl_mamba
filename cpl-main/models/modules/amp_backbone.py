@@ -43,10 +43,21 @@ def _ensure_hieramamba_paths():
     repo_root = Path(__file__).resolve().parents[3]
     hiera_root = repo_root / "hieramamba-main"
     hydra_root = hiera_root / "hydra"
-    for path in (hiera_root, hydra_root):
+    libs_root = hiera_root / "libs"
+    for path in (hiera_root, hydra_root, libs_root):
         path_str = str(path)
-        if path_str not in sys.path:
-            sys.path.insert(0, path_str)
+        if path_str in sys.path:
+            sys.path.remove(path_str)
+        sys.path.insert(0, path_str)
+
+    # 如果环境里先加载过 hydra-core 或其他同名包，这里清掉非本仓库模块缓存，
+    # 否则 `from hydra.modules.hydra import Hydra` 可能解析到错误的包。
+    local_roots = (str(hiera_root), str(hydra_root), str(libs_root))
+    for name in list(sys.modules):
+        if name == "hydra" or name.startswith("hydra."):
+            module_file = getattr(sys.modules[name], "__file__", "") or ""
+            if module_file and not module_file.startswith(local_roots):
+                del sys.modules[name]
 
 
 def _load_hieramamba_backbone():
