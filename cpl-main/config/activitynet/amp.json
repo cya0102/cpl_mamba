@@ -1,7 +1,7 @@
 {
   "dataset": {
     "dataset": "ActivityNet",
-    "feature_path": "data/activitynet/sub_activitynet_v1-3.c3d.hdf5",
+    "feature_path": "/data/chenyuan/videogrounding/VGDataset/ActivityNet/c3dfeat_hdf5/sub_activitynet_v1-3.c3d.hdf5",
     "vocab_size": 8000,
     "word_dim": 300,
     "frame_dim": 500,

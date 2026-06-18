@@ -1,7 +1,7 @@
 {
   "dataset": {
     "dataset": "CharadesSTA",
-    "feature_path": "data/charades/i3d_features.hdf5",
+    "feature_path": "/data/chenyuan/videogrounding/VGDataset/Charades-STA/i3dfeatures/i3d_features.hdf5",
     "vocab_size": 1111,
     "word_dim": 300,
     "frame_dim": 1024,
