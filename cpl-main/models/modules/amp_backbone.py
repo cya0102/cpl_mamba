@@ -27,7 +27,9 @@ AMP backbone adapter for CPL.
 """
 
 from pathlib import Path
+import importlib
 import sys
+import types
 
 import torch
 import torch.nn as nn
@@ -50,14 +52,38 @@ def _ensure_hieramamba_paths():
             sys.path.remove(path_str)
         sys.path.insert(0, path_str)
 
-    # 如果环境里先加载过 hydra-core 或其他同名包，这里清掉非本仓库模块缓存，
-    # 否则 `from hydra.modules.hydra import Hydra` 可能解析到错误的包。
     local_roots = (str(hiera_root), str(hydra_root), str(libs_root))
     for name in list(sys.modules):
-        if name == "hydra" or name.startswith("hydra."):
+        if name in ("hydra", "libs") or name.startswith(("hydra.", "libs.")):
             module_file = getattr(sys.modules[name], "__file__", "") or ""
-            if module_file and not module_file.startswith(local_roots):
+            if not module_file or not module_file.startswith(local_roots):
                 del sys.modules[name]
+    return hiera_root, hydra_root, libs_root
+
+
+def _register_minimal_package(name, path):
+    """注册一个不执行 __init__.py 的 package，占位给相对导入使用。"""
+    module = types.ModuleType(name)
+    module.__path__ = [str(path)]
+    module.__package__ = name
+    sys.modules[name] = module
+    return module
+
+
+def _register_hieramamba_modules(hiera_root, hydra_root):
+    """
+    注册 CPL 需要的最小 HieraMamba/Hydra 包结构。
+
+    这会绕开 `libs/__init__.py`、`libs/modeling/__init__.py` 和 `hydra/__init__.py`，
+    避免导入 HieraMamba 原仓库完整训练/BERT 栈时触发 transformers 版本冲突。
+    """
+    libs_pkg = _register_minimal_package("libs", hiera_root / "libs")
+    modeling_pkg = _register_minimal_package("libs.modeling", hiera_root / "libs" / "modeling")
+    setattr(libs_pkg, "modeling", modeling_pkg)
+
+    hydra_pkg = _register_minimal_package("hydra", hydra_root / "hydra")
+    hydra_modules_pkg = _register_minimal_package("hydra.modules", hydra_root / "hydra" / "modules")
+    setattr(hydra_pkg, "modules", hydra_modules_pkg)
 
 
 def _load_hieramamba_backbone():
@@ -70,9 +96,11 @@ def _load_hieramamba_backbone():
     global _HIERA_IMPORT_ERROR, _HIERA_BACKBONE_CLASS
     if _HIERA_BACKBONE_CLASS is not None:
         return _HIERA_BACKBONE_CLASS
-    _ensure_hieramamba_paths()
+    hiera_root, hydra_root, _ = _ensure_hieramamba_paths()
+    _register_hieramamba_modules(hiera_root, hydra_root)
     try:
-        from libs.modeling.video_net import HieraMambaBackbone as OriginalHieraMambaBackbone
+        video_net = importlib.import_module("libs.modeling.video_net")
+        OriginalHieraMambaBackbone = video_net.HieraMambaBackbone
     except Exception as exc:
         _HIERA_IMPORT_ERROR = exc
         return None
