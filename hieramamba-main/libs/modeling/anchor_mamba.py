@@ -11,12 +11,13 @@ from mamba_ssm import Mamba2
 from .blocks import TransformerEncoder, MaskedMaxPool1D, SwiGLUFFN
 import os
 
-# Set environment variable for triton to use IEEE float32 precision for lower GPU capabilities
-# Especially important for using Mamba2 to avoid issues on order GPUs
-gpu_id = torch.cuda.current_device()
-gpu_capability =torch.cuda.get_device_capability(gpu_id)
-if gpu_capability[0] < 8:
-    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+# Set environment variable for triton to use IEEE float32 precision for lower GPU capabilities.
+# Keep this guarded so importing HieraMamba modules on a CPU-only login node still works.
+if torch.cuda.is_available():
+    gpu_id = torch.cuda.current_device()
+    gpu_capability = torch.cuda.get_device_capability(gpu_id)
+    if gpu_capability[0] < 8:
+        os.environ["TRITON_F32_DEFAULT"] = "ieee"
 
 class BaseAnchorBlock(nn.Module):
     """
@@ -109,8 +110,10 @@ class BaseAnchorBlock(nn.Module):
         if pad_len > 0:
             # Pad with zeros to make the sequence length a multiple of the stride
             x_padded = F.pad(x, (0, pad_len))
+            mask_padded = F.pad(mask, (0, pad_len), value=False)
         else:
             x_padded = x
+            mask_padded = mask
 
         # 2) Reshape into blocks of size <s> for pooling AND interleaving
         x_blocks = x_padded.reshape(B, D, num_blocks, s)
@@ -131,16 +134,9 @@ class BaseAnchorBlock(nn.Module):
 
         # 7) Create the correct masks for the new packed sequence
         anchor_mask = downsample_mask(mask, s)  # (B, 1, num_blocks)
-
-        nonmasked_seq_len = int(mask.sum().item())
-        nonmasked_anchor_len = int(anchor_mask.sum().item())
-        nonmasked_len = nonmasked_seq_len + nonmasked_anchor_len
-
-        # Create a packed mask for the combined sequence. This assumes all
-        # valid tokens/anchors will be packed at the start of the sequence
-        # in a subsequent operation (common for attention).
-        expanded_mask = torch.zeros((B, x_combined.size(1), 1), dtype=torch.bool, device=device)
-        expanded_mask[:, :nonmasked_len] = True
+        token_mask = mask_padded.reshape(B, 1, num_blocks, s)
+        mixed_mask = torch.cat((anchor_mask.unsqueeze(-1), token_mask), dim=-1)
+        expanded_mask = mixed_mask.permute(0, 2, 3, 1).reshape(B, -1, 1)
 
         return x_combined, anchor_positions, expanded_mask, anchor_mask
 

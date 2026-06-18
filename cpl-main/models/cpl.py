@@ -5,9 +5,21 @@ import torch.nn.functional as F
 
 from models.transformer import DualTransformer
 from models.modules.amp_backbone import HieraAMPBackbone
-import math
 
 class CPL(nn.Module):
+    """
+    CPL 主模型。
+
+    原始 CPL 流程:
+        video frames -> frame_fc -> DualTransformer -> Gaussian proposals
+        words        -> word_fc  -> masked semantic completion
+
+    AMP 打开后:
+        video frames -> HieraAMPBackbone -> 多尺度 sequence/anchor 特征
+        sequence 特征替代原 frame_fc 输出参与 CPL 的 Gaussian proposal 与语义补全；
+        anchor 特征额外生成无 query 条件的视频结构先验，再通过 gate 与 CPL 原本
+        query-conditioned Gaussian logits 融合。
+    """
     def __init__(self, config):
         super().__init__()
         self.dropout = config['dropout']
@@ -22,11 +34,15 @@ class CPL(nn.Module):
         self.amp_config = config.get('AMP', {})
         self.use_amp = self.amp_config.get('enabled', False)
         self.use_anchor_prior = self.use_amp and self.amp_config.get('use_anchor_prior', True)
+        self.amp_proposal_source = self.amp_config.get('proposal_source', 'anchor')
+        self.amp_proposal_anchor_scale = int(self.amp_config.get('proposal_anchor_scale', 1))
 
+        # Baseline CPL 使用 frame_fc 投影原始帧特征；AMP 分支仍复用它投影 pred token。
         self.frame_fc = nn.Linear(config['frames_input_size'], self.hidden_size)
         if self.use_amp:
             backbone_config = dict(self.amp_config.get('backbone', {}))
             backbone_dropout = backbone_config.pop('dropout', self.dropout)
+            # AMP backbone 输出 hidden_size 维的视频 token，保证下游 DualTransformer 不改接口。
             self.amp_backbone = HieraAMPBackbone(
                 in_dim=config['frames_input_size'],
                 out_dim=self.hidden_size,
@@ -46,6 +62,7 @@ class CPL(nn.Module):
         self.fc_comp = nn.Linear(self.hidden_size, self.vocab_size)
         self.fc_gauss = nn.Linear(self.hidden_size, self.num_props*2)
         if self.use_anchor_prior:
+            # anchor_prior: 仅从视频 anchor 摘要预测 proposal 参数，提供不依赖 query 的结构先验。
             self.fc_anchor_prior = nn.Sequential(
                 nn.LayerNorm(self.hidden_size),
                 nn.Linear(self.hidden_size, self.hidden_size),
@@ -53,6 +70,7 @@ class CPL(nn.Module):
                 nn.Dropout(self.dropout),
                 nn.Linear(self.hidden_size, self.num_props*2),
             )
+            # anchor_gate: 根据 query 表征、anchor 摘要和视频长度，动态决定信任 CPL 预测还是 anchor 先验。
             self.fc_anchor_gate = nn.Linear(self.hidden_size * 2 + 1, self.num_props*2)
             nn.init.constant_(self.fc_anchor_gate.bias, self.amp_config.get('gate_bias', 2.0))
  
@@ -66,11 +84,17 @@ class CPL(nn.Module):
         bsz, n_frames, _ = frames_feat.shape
         amp_out = None
         if self.use_amp:
+            # 1) AMP 视频编码:
+            #    输入 (B, T, C_in)，输出 finest-level sequence token (B, T', hidden)
+            #    以及多尺度 anchor_fpn/anchor_masks，供 proposal 先验使用。
             frames_feat = F.dropout(frames_feat, self.dropout, self.training)
             frames_mask = _generate_mask(frames_feat, frames_len).bool()
             amp_out = self.amp_backbone(frames_feat, frames_mask)
             frames_feat = amp_out['frames']
             props_source_len = frames_feat.size(1)
+
+            # 2) 保留 CPL 原设计中的 pred token。它不属于真实视频帧，mask 置 0；
+            #    DualTransformer 仍可在最后位置产生 proposal 查询状态 h[:, -1]。
             pred_vec = self.pred_vec.view(1, 1, -1).expand(bsz, 1, -1)
             pred_vec = F.dropout(pred_vec, self.dropout, self.training)
             pred_vec = self.frame_fc(pred_vec)
@@ -81,6 +105,7 @@ class CPL(nn.Module):
                 frames_mask = _generate_mask(frames_feat[:, :props_source_len], frame_mask_len)
             frames_mask = torch.cat([frames_mask, frames_mask.new_zeros(bsz, 1)], dim=1)
         else:
+            # Baseline CPL 路径保持原行为: 拼接 pred token 后做 dropout + frame_fc。
             pred_vec = self.pred_vec.view(1, 1, -1).expand(bsz, 1, -1)
             frames_feat = torch.cat([frames_feat, pred_vec], dim=1)
             frames_feat = F.dropout(frames_feat, self.dropout, self.training)
@@ -94,12 +119,16 @@ class CPL(nn.Module):
         words_feat = self.word_fc(words_feat)
         words_mask = _generate_mask(words_feat, words_len + 1)
 
-        # generate Gaussian masks
+        # 3) Query-conditioned Gaussian 预测:
+        #    decoding=1 用文本上下文引导视频 token，h[:, -1] 是 pred token 的 proposal 查询状态。
         enc_out, h = self.trans(frames_feat, frames_mask, words_feat + words_pos, words_mask, decoding=1)
         trans_gauss_logits = self.fc_gauss(h[:, -1]).view(bsz, self.num_props, 2)
         anchor_gate = None
         anchor_gauss_param = None
         if self.use_anchor_prior:
+            # 4) Anchor-aware Gaussian prior:
+            #    多尺度 anchor 做 masked mean pooling，得到视频结构摘要；
+            #    摘要预测无条件 proposal，再用 gate 与 query-conditioned proposal 融合。
             anchor_summary = self._anchor_summary(amp_out['anchor_fpn'], amp_out['anchor_masks'])
             anchor_gauss_logits = self.fc_anchor_prior(anchor_summary).view(bsz, self.num_props, 2)
             length_ratio = frames_len.float().to(frames_feat.device) / max(float(n_frames), 1.0)
@@ -113,11 +142,16 @@ class CPL(nn.Module):
         gauss_center = gauss_param[:, 0]
         gauss_width = gauss_param[:, 1]
 
-        # downsample for effeciency
-        props_len = max(props_source_len//4, 1)
-        keep_idx = torch.linspace(0, props_source_len-1, steps=props_len, device=frames_feat.device).long()
-        frames_feat = frames_feat[:, keep_idx]
-        frames_mask = frames_mask[:, keep_idx]
+        # 5) Semantic completion 的视频源:
+        #    baseline 仍用原 CPL 的 4x 均匀采样；
+        #    AMP 默认改用 HieraMamba anchor_fpn 的 T/4 层，避免再对增强帧做简单池化/采样。
+        frames_feat, frames_mask = self._build_proposal_source(
+            frames_feat[:, :props_source_len],
+            frames_mask[:, :props_source_len],
+            props_source_len,
+            amp_out,
+        )
+        props_len = frames_feat.size(1)
         props_feat = frames_feat.unsqueeze(1) \
             .expand(bsz, self.num_props, -1, -1).contiguous().view(bsz*self.num_props, props_len, -1)
         props_mask = frames_mask.unsqueeze(1) \
@@ -125,7 +159,9 @@ class CPL(nn.Module):
 
         gauss_weight = self.generate_gauss_weight(props_len, gauss_center, gauss_width)
         
-        # semantic completion
+        # 6) Semantic completion:
+        #    每个 Gaussian proposal 作为视频注意力权重，重建被 mask 的文本 token。
+        #    训练/eval 仍沿用 CPL 的 loss-based proposal 选择逻辑。
         words_feat, masked_words = self._mask_words(words_feat, words_len, weights=weights)
         words_feat = words_feat + words_pos
         words_feat = words_feat[:, :-1]
@@ -143,6 +179,7 @@ class CPL(nn.Module):
         words_logit = self.fc_comp(h)
 
         if self.use_negative:
+            # 7) Easy-to-hard negative proposal mining 保持 CPL 原机制不变。
             neg_1_weight, neg_2_weight = self.negative_proposal_mining(props_len, gauss_center, gauss_width, kwargs['epoch'])
             
             _, neg_h_1 = self.trans(props_feat, props_mask, words_feat1, words_mask1, decoding=2, gauss_weight=neg_1_weight)
@@ -177,12 +214,14 @@ class CPL(nn.Module):
         return output
 
     def _scale_lengths(self, lengths, old_len, new_len):
+        """当 AMP backbone 改变时间长度时，将原始帧长度映射到新 token 长度。"""
         if old_len == new_len:
             return lengths
         scaled = torch.ceil(lengths.float() * float(new_len) / max(float(old_len), 1.0)).long()
         return scaled.clamp(min=1, max=new_len)
 
     def _anchor_summary(self, anchor_fpn, anchor_masks):
+        """对每一层 anchor 做 masked mean pooling，再跨尺度平均成一个视频结构摘要。"""
         summaries = []
         for feat, mask in zip(anchor_fpn, anchor_masks):
             mask = mask.to(feat.device).float().unsqueeze(-1)
@@ -190,7 +229,36 @@ class CPL(nn.Module):
             summaries.append((feat * mask).sum(dim=1) / denom)
         return torch.stack(summaries, dim=1).mean(dim=1)
 
+    def _build_proposal_source(self, frames_feat, frames_mask, props_source_len, amp_out):
+        """
+        构造 semantic completion 使用的视频 token。
+
+        - AMP proposal_source='anchor': 使用 HieraMamba anchor_fpn 的某一层。
+          默认 proposal_anchor_scale=1，对应原始 T -> T/2 -> T/4 的第二层 anchor，
+          与 CPL 原先 props_source_len//4 的计算量接近，但特征来自 AMP anchor。
+        - AMP proposal_source='sequence': 使用指定层 sequence_fpn。
+        - 其他情况: 保留原 CPL 的均匀采样。
+        """
+        if self.use_amp and amp_out is not None:
+            if self.amp_proposal_source == 'anchor':
+                scale = min(self.amp_proposal_anchor_scale, len(amp_out['anchor_fpn']) - 1)
+                return (
+                    amp_out['anchor_fpn'][scale],
+                    amp_out['anchor_masks'][scale].to(frames_feat.device),
+                )
+            if self.amp_proposal_source == 'sequence':
+                scale = min(self.amp_proposal_anchor_scale, len(amp_out['sequence_fpn']) - 1)
+                return (
+                    amp_out['sequence_fpn'][scale],
+                    amp_out['sequence_masks'][scale].to(frames_feat.device),
+                )
+
+        props_len = max(props_source_len // 4, 1)
+        keep_idx = torch.linspace(0, props_source_len - 1, steps=props_len, device=frames_feat.device).long()
+        return frames_feat[:, keep_idx], frames_mask[:, keep_idx]
+
     def _load_amp_pretrained(self, pretrained_path):
+        """按 key/shape 尽量加载 HieraMamba 或 AMP checkpoint，维度不匹配的层会自动跳过。"""
         checkpoint = torch.load(pretrained_path, map_location='cpu')
         state_dict = checkpoint
         if isinstance(checkpoint, dict):
@@ -213,7 +281,12 @@ class CPL(nn.Module):
                 continue
             candidates = [key]
             candidates.extend(key[len(prefix):] for prefix in prefixes if key.startswith(prefix))
+            wrapped_candidates = []
             for candidate in candidates:
+                wrapped_candidates.append(candidate)
+                if not candidate.startswith('backbone.'):
+                    wrapped_candidates.append('backbone.' + candidate)
+            for candidate in wrapped_candidates:
                 if candidate in target_state and target_state[candidate].shape == value.shape:
                     filtered[candidate] = value
                     break

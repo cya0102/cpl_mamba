@@ -131,6 +131,12 @@ pip install numpy==1.26.4 h5py==3.10.0 nltk==3.8.1 tqdm==4.66.4 scipy==1.11.4
 pip install Cython==0.29.36 hydra-core==1.0.7 omegaconf==2.0.6
 pip install fairseq==0.12.2
 
+# CPL+AMP 不依赖 transformers；如果环境里已有新版 transformers，它可能要求 torch>=2.4。
+# 保守做法是卸载，或固定到较旧版本。
+pip uninstall -y transformers tokenizers
+# 可选：只有你额外运行 HieraMamba 原仓库脚本时才需要 transformers。
+# pip install transformers==4.38.2 tokenizers==0.15.2
+
 export TORCH_CUDA_ARCH_LIST="7.5;8.6"
 pip install causal-conv1d==1.4.0 --no-build-isolation
 pip install mamba-ssm==2.2.3 --no-build-isolation
@@ -186,6 +192,8 @@ dependencies:
       - hydra-core==1.0.7
       - omegaconf==2.0.6
       - fairseq==0.12.2
+      # CPL+AMP 本身不需要 transformers；不要安装最新版 transformers，
+      # 否则它可能要求 torch>=2.4 并打印 backend disabled 警告。
 ```
 
 创建后再单独安装 CUDA 扩展：
@@ -237,3 +245,31 @@ python train.py --config-path config/activitynet/amp.json --log_dir logs --tag a
 ```
 
 这样会走卷积 fallback，不代表最终 AMP 实验效果，只用于排查数据、loss、checkpoint 等流程。
+
+## transformers 警告处理
+
+如果训练启动时看到：
+
+```text
+[transformers] Disabling PyTorch because PyTorch >= 2.4 is required but found 2.2.2+cu118
+[transformers] PyTorch was not found. Models won't be available ...
+```
+
+这是因为环境里安装了过新的 `transformers`，它要求更高版本 PyTorch。`cpl-main` 的训练代码不使用 `transformers`，所以如果训练能继续，这个提示可以忽略；如果它影响启动，直接卸载：
+
+```bash
+pip uninstall -y transformers tokenizers
+```
+
+如果你还要在同一个环境里运行 HieraMamba 原仓库中依赖 transformers 的脚本，则不要装最新版，固定旧版：
+
+```bash
+pip install transformers==4.38.2 tokenizers==0.15.2
+```
+
+然后再验证：
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+python -c "from mamba_ssm import Mamba2; print('mamba ok')"
+```

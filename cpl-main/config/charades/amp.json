@@ -41,17 +41,26 @@
         "freeze_backbone": false,
         "pretrained_path": null,
         "gate_bias": 2.0,
+        "proposal_source": "anchor",
+        "proposal_anchor_scale": 1,
         "backbone": {
           "embd_dim": 384,
           "max_seq_len": 200,
           "n_heads": 4,
+          "mha_win_size": 0,
           "stride": 1,
-          "arch": [1, 0, 3],
+          "arch": [2, 0, 8],
           "dropout": 0.1,
+          "attn_pdrop": 0.0,
+          "proj_pdrop": 0.1,
+          "path_pdrop": 0.1,
           "use_abs_pe": true,
           "pool_method": "mean",
+          "block_type": "AnchorMambaPoolingBlockGated",
           "ffn_ratio": 2,
-          "local_encode": false,
+          "local_encode": true,
+          "local_encoder_type": "transformer",
+          "local_window_size": 5,
           "local_encode_num_layers": 0,
           "mamba_headdim": 64,
           "mamba_dstate": 64,
@@ -59,7 +68,7 @@
           "mamba_dconv": 7,
           "bidirectional": true,
           "use_mamba": true,
-          "pyramid_fusion": "sum"
+          "pyramid_fusion": "first"
         }
       },
       "DualTransformer": {
