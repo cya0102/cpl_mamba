@@ -7,9 +7,26 @@ import torch.nn.functional as F
 import math
 
 from hydra.modules.hydra import Hydra
-from mamba_ssm import Mamba2
 from .blocks import TransformerEncoder, MaskedMaxPool1D, SwiGLUFFN
 import os
+
+
+def _load_mamba2():
+    """
+    Lazily import Mamba2 only for the unidirectional fallback path.
+
+    CPL 的 HieraMamba AMP 默认 `bidirectional=True`，实际使用 Hydra。旧版
+    `from mamba_ssm import Mamba2` 会触发 mamba_ssm 顶层 HuggingFace 集成导入，
+    在 transformers 版本不匹配时即使不用 Mamba2 也会启动失败。
+    """
+    try:
+        from mamba_ssm import Mamba2
+    except ImportError as exc:
+        raise ImportError(
+            "Mamba2 is only required when bidirectional=False. "
+            "Use bidirectional=True for Hydra AMP, or fix the mamba_ssm/transformers versions."
+        ) from exc
+    return Mamba2
 
 # Set environment variable for triton to use IEEE float32 precision for lower GPU capabilities.
 # Keep this guarded so importing HieraMamba modules on a CPU-only login node still works.
@@ -381,6 +398,7 @@ class AnchorMambaPoolingBlockGated(BaseAnchorBlock):
                 use_mem_eff_path=True, headdim=mamba_headdim
             )
         else:
+            Mamba2 = _load_mamba2()
             self.global_encoder = Mamba2(
                 d_model=d_model, d_state=mamba_dstate, d_conv=4, expand=mamba_expand,
                 headdim=48
@@ -575,6 +593,7 @@ class AnchorMambaPoolingBlock(BaseAnchorBlock):
                 use_mem_eff_path=True, headdim=mamba_headdim
             )
         else:
+            Mamba2 = _load_mamba2()
             self.global_encoder = Mamba2(
                 d_model=d_model, d_state=mamba_dstate, d_conv=4, expand=mamba_expand,
                 headdim=48

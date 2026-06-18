@@ -86,6 +86,38 @@ def _register_hieramamba_modules(hiera_root, hydra_root):
     setattr(hydra_pkg, "modules", hydra_modules_pkg)
 
 
+def _patch_transformers_generation_outputs():
+    """
+    兼容旧 mamba_ssm/HieraMamba 对 transformers generation 输出类名的导入。
+
+    新版 transformers 删除/移动了 GreedySearchDecoderOnlyOutput 等旧名字；
+    这些名字只在 mamba_ssm 的 HuggingFace 集成导入阶段用到，CPL 的 AMP
+    前向不会调用文本生成逻辑，因此补空占位即可避免无关依赖把训练启动卡死。
+    """
+    try:
+        import transformers.generation as generation
+        try:
+            import transformers.generation.utils as generation_utils
+        except Exception:
+            generation_utils = None
+    except Exception:
+        return
+    for name in (
+        "GreedySearchDecoderOnlyOutput",
+        "GreedySearchEncoderDecoderOutput",
+        "SampleDecoderOnlyOutput",
+        "SampleEncoderDecoderOutput",
+        "BeamSearchDecoderOnlyOutput",
+        "BeamSearchEncoderDecoderOutput",
+        "BeamSampleDecoderOnlyOutput",
+        "BeamSampleEncoderDecoderOutput",
+    ):
+        if not hasattr(generation, name):
+            setattr(generation, name, type(name, (object,), {}))
+        if generation_utils is not None and not hasattr(generation_utils, name):
+            setattr(generation_utils, name, getattr(generation, name))
+
+
 def _load_hieramamba_backbone():
     """
     延迟导入原版 HieraMamba backbone。
@@ -98,6 +130,7 @@ def _load_hieramamba_backbone():
         return _HIERA_BACKBONE_CLASS
     hiera_root, hydra_root, _ = _ensure_hieramamba_paths()
     _register_hieramamba_modules(hiera_root, hydra_root)
+    _patch_transformers_generation_outputs()
     try:
         video_net = importlib.import_module("libs.modeling.video_net")
         OriginalHieraMambaBackbone = video_net.HieraMambaBackbone
